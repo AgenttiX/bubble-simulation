@@ -1,0 +1,38 @@
+[package]
+name = "bubble-simulation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Live GPU lattice simulation of bubble nucleation and growth in a first-order cosmological phase transition"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+# GPU: compute + render through a single API, no CPU round-trip for simulation state.
+wgpu = "29.0"
+winit = { version = "0.30.13", features = ["rwh_06", "x11", "wayland"] }
+
+# Immediate-mode UI overlay for live parameter control.
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = { version = "0.35", default-features = false, features = ["links", "wayland", "x11"] }
+
+glam = { version = "0.30", features = ["bytemuck"] }
+bytemuck = { version = "1.19", features = ["derive"] }
+pollster = "0.4"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.9"
+rand_pcg = "0.9"
+png = "0.18"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# The simulation is GPU-bound, but debug builds of the host still drive it fine.
+[profile.dev]
+opt-level = 1
