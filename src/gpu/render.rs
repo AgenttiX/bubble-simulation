@@ -142,6 +142,9 @@ pub struct VolumeRenderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    // Kept so the bind group can be rebuilt when the lattice is resized.
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     /// Half-extents of the lattice in world units, normalised so the longest
     /// axis spans 1.0.
     box_half: Vec3,
@@ -253,22 +256,31 @@ impl VolumeRenderer {
             cache: None,
         });
 
-        let n_max = grid.iter().copied().max().unwrap_or(1) as f32;
-        let box_half = Vec3::new(
-            0.5 * grid[0] as f32 / n_max,
-            0.5 * grid[1] as f32 / n_max,
-            0.5 * grid[2] as f32 / n_max,
-        );
+        let (box_half, cell) = box_dimensions(grid);
 
         Self {
             pipeline,
             bind_group,
             uniform,
+            layout,
+            sampler,
             box_half,
-            cell: 1.0 / n_max,
+            cell,
             grid,
             frame: 0,
         }
+    }
+
+    /// Point the renderer at a new visualisation texture, after the lattice has
+    /// been resized. The pipeline and sampler are unaffected; only the bind
+    /// group and the world-space box dimensions change.
+    pub fn rebind(&mut self, device: &wgpu::Device, vis_view: &wgpu::TextureView, grid: [u32; 3]) {
+        self.bind_group =
+            make_bind_group(device, &self.layout, &self.uniform, vis_view, &self.sampler);
+        let (box_half, cell) = box_dimensions(grid);
+        self.box_half = box_half;
+        self.cell = cell;
+        self.grid = grid;
     }
 
     pub fn box_half(&self) -> Vec3 {
@@ -343,6 +355,18 @@ impl VolumeRenderer {
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
+}
+
+/// World-space half-extents of the lattice box and the size of one cell,
+/// normalised so the longest axis spans 1.0.
+fn box_dimensions(grid: [u32; 3]) -> (Vec3, f32) {
+    let n_max = grid.iter().copied().max().unwrap_or(1) as f32;
+    let half = Vec3::new(
+        0.5 * grid[0] as f32 / n_max,
+        0.5 * grid[1] as f32 / n_max,
+        0.5 * grid[2] as f32 / n_max,
+    );
+    (half, 1.0 / n_max)
 }
 
 fn make_bind_group(

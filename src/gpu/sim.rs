@@ -42,6 +42,23 @@ const MAX_BUBBLES: usize = 1024;
 
 const DIAG_BYTES: u64 = 32;
 
+/// Smallest lattice the MUSCL stencil can address without a cell reaching its
+/// own periodic image.
+pub const MIN_GRID: u32 = 8;
+
+/// Upper bound offered in the UI. Well past what any current device can hold;
+/// it exists so the slider range stays finite when memory cannot be queried.
+pub const MAX_GRID: u32 = 2048;
+
+/// The largest cubic lattice that fits, and why it is the largest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LatticeCap {
+    pub side: u32,
+    /// True when free memory is the binding constraint rather than the
+    /// device's storage-buffer binding limit.
+    pub limited_by_memory: bool,
+}
+
 // ---------------------------------------------------------------------------
 //  GPU-side parameter blocks (must mirror shaders/common.wgsl exactly)
 // ---------------------------------------------------------------------------
@@ -163,6 +180,9 @@ enum ReadbackState {
 pub struct Simulation {
     pub model: Model,
     pub grid: [u32; 3],
+    /// The spec this was built from, so a resize can rebuild with one field
+    /// changed rather than reassembling the arguments at the call site.
+    spec: SimulationSpec,
     pub time: Scalar,
     pub steps: u64,
     /// Visualisation gain applied inside `vis.wgsl`; currently unused headroom
@@ -238,26 +258,11 @@ impl Simulation {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, spec: SimulationSpec) -> Result<Self> {
         let SimulationSpec { model, grid, precision, .. } = spec;
         model.validate().map_err(anyhow::Error::msg)?;
-        for (axis, n) in grid.iter().enumerate() {
-            anyhow::ensure!(
-                *n >= 8,
-                "grid dimension {axis} is {n}; the 5-point stencil needs at least 8 cells"
-            );
-        }
+        Self::check_fits(device, grid)?;
 
         let n_cells = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
         let field_bytes = n_cells * 8;
         let fluid_bytes = n_cells * 16;
-
-        let limits = device.limits();
-        anyhow::ensure!(
-            fluid_bytes <= limits.max_storage_buffer_binding_size,
-            "a {}x{}x{} lattice needs {:.1} MB per fluid buffer, above this device's \
-             max_storage_buffer_binding_size of {:.1} MB",
-            grid[0], grid[1], grid[2],
-            fluid_bytes as f64 / 1e6,
-            limits.max_storage_buffer_binding_size as f64 / 1e6,
-        );
 
         // ---- shader modules -------------------------------------------------
         let module = |name: &str| {
@@ -546,7 +551,7 @@ impl Simulation {
         let schedule = make_schedule(
             spec.nucleation,
             spec.bubbles,
-            model.default_seed_radius(),
+            model.seed_radius(),
             grid,
             spec.nucleation_duration,
             spec.seed,
@@ -555,6 +560,7 @@ impl Simulation {
         let mut sim = Self {
             model,
             grid,
+            spec,
             time: 0.0,
             steps: 0,
             vis_gain: 1.0,
@@ -675,17 +681,104 @@ impl Simulation {
         self.schedule.len().saturating_sub(self.next_event)
     }
 
-    /// Total device memory held by the lattice buffers.  Dominated by the three
-    /// state slots plus the primitive cache; the visualisation texture and the
-    /// diagnostics scratch are negligible next to those.
+    /// Device memory this simulation actually holds, counted from the
+    /// allocations themselves rather than predicted.
+    ///
+    /// [`Self::lattice_bytes`] is the estimate used *before* allocating; this
+    /// is the truth afterwards. They agree to well under a percent -- the
+    /// difference is the fixed-size scratch (reduction partials, diagnostics,
+    /// the bubble list and the parameter uniforms), a few tens of kilobytes.
     pub fn device_memory_bytes(&self) -> u64 {
-        let state: u64 = self
+        let buffers: u64 = self
             .field
             .iter()
             .chain(self.fluid.iter())
+            .chain([&self.prim, &self.partials, &self.diag, &self.bubbles, &self.batch_ub])
+            .chain(self.stage_ub.iter())
+            .chain([&self.params_ub])
             .map(wgpu::Buffer::size)
             .sum();
-        state + self.prim.size() + self.partials.size()
+        // The visualisation texture is rgba16float: 8 bytes per cell.
+        buffers + self.n_cells * 8
+    }
+
+    /// Device memory a lattice of the given size will need, in bytes.
+    ///
+    /// Three RK state slots (`field` 8 B + `fluid` 16 B per cell), the
+    /// primitive cache (16 B), and the visualisation texture (`rgba16float`,
+    /// 8 B) -- 96 bytes per cell. Everything else (parameter uniforms, the
+    /// 1024-entry reduction scratch, the bubble list) is a few tens of
+    /// kilobytes and is ignored here.
+    pub fn lattice_bytes(grid: [u32; 3]) -> u64 {
+        let cells = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
+        cells * (3 * (8 + 16) + 16 + 8)
+    }
+
+    /// The largest cubic lattice that fits both the device's binding limit and
+    /// a memory budget, and which of the two binds.
+    ///
+    /// Two independent ceilings apply. `max_storage_buffer_binding_size` caps
+    /// the `fluid` buffer at 16 bytes per cell and no amount of free memory
+    /// relaxes it; the memory budget caps the total at 96 bytes per cell. Pass
+    /// `None` for the budget when the backend cannot report memory, in which
+    /// case only the binding limit applies.
+    pub fn max_cubic_size(max_storage_binding: u64, budget_bytes: Option<u64>) -> LatticeCap {
+        let side = |cells: u64| (cells as f64).cbrt().floor() as u32;
+        let by_binding = side(max_storage_binding / 16);
+        let by_budget = budget_bytes.map_or(u32::MAX, |b| side(b / 96));
+        LatticeCap {
+            side: by_binding.min(by_budget).clamp(MIN_GRID, MAX_GRID),
+            limited_by_memory: by_budget < by_binding,
+        }
+    }
+
+    /// Rebuild at a new lattice size, keeping every other parameter.
+    ///
+    /// The old lattice is released *before* the new one is allocated, so peak
+    /// device memory is `max(old, new)` rather than `old + new`. Without that,
+    /// shrinking a lattice could fail for want of memory, which would be an
+    /// absurd way to run out. The intermediate is a minimum-size simulation,
+    /// which costs one extra pipeline build (a few milliseconds, on a
+    /// user-initiated action) and keeps `self` valid throughout.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grid: [u32; 3],
+    ) -> Result<()> {
+        let spec = SimulationSpec { grid, ..self.spec };
+        // Validate before releasing anything, so a rejected size leaves the
+        // running simulation untouched.
+        Self::check_fits(device, grid)?;
+
+        // Let in-flight work finish; wgpu cannot reclaim memory still
+        // referenced by a queued submission.
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        *self = Self::new(device, queue, SimulationSpec { grid: [MIN_GRID; 3], ..spec })?;
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+
+        *self = Self::new(device, queue, spec)?;
+        Ok(())
+    }
+
+    fn check_fits(device: &wgpu::Device, grid: [u32; 3]) -> Result<()> {
+        for (axis, n) in grid.iter().enumerate() {
+            anyhow::ensure!(
+                *n >= MIN_GRID,
+                "grid axis {axis} is {n}; the 5-point stencil needs at least {MIN_GRID} cells"
+            );
+        }
+        let limits = device.limits();
+        let cells = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
+        anyhow::ensure!(
+            cells * 16 <= limits.max_storage_buffer_binding_size,
+            "a {}x{}x{} lattice needs {:.2} GB per fluid buffer, above this device's \
+             max_storage_buffer_binding_size of {:.2} GB",
+            grid[0], grid[1], grid[2],
+            cells as f64 * 16.0 / 1e9,
+            limits.max_storage_buffer_binding_size as f64 / 1e9,
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -918,7 +1011,7 @@ impl Simulation {
 
     /// Queue an extra bubble at a random position, effective immediately.
     pub fn nucleate_now(&mut self, rng: &mut impl rand::Rng) {
-        let r = self.model.default_seed_radius();
+        let r = self.model.seed_radius();
         let event = BubbleEvent {
             time: self.time,
             pos: [
@@ -982,6 +1075,34 @@ mod tests {
         assert_eq!(std::mem::size_of::<StageParamsGpu>(), 16);
         assert_eq!(std::mem::size_of::<BubbleGpu>(), 16);
         assert_eq!(std::mem::size_of::<DiagnosticsGpu>() as u64, DIAG_BYTES);
+    }
+
+    #[test]
+    fn lattice_bytes_is_96_per_cell() {
+        assert_eq!(Simulation::lattice_bytes([100, 10, 10]), 10_000 * 96);
+    }
+
+    #[test]
+    fn cap_reports_which_limit_binds() {
+        // 2 GB binding limit, plenty of memory -> the binding limit binds.
+        let plenty = Simulation::max_cubic_size(2_147_483_648, Some(1 << 60));
+        assert!(!plenty.limited_by_memory);
+        assert_eq!(plenty.side, ((2_147_483_648u64 / 16) as f64).cbrt().floor() as u32);
+
+        // Same device, 1 GB of memory -> memory binds.
+        let tight = Simulation::max_cubic_size(2_147_483_648, Some(1_000_000_000));
+        assert!(tight.limited_by_memory);
+        assert!(tight.side < plenty.side);
+        assert!(Simulation::lattice_bytes([tight.side; 3]) <= 1_000_000_000);
+
+        // No memory report -> only the binding limit applies.
+        assert_eq!(Simulation::max_cubic_size(2_147_483_648, None).side, plenty.side);
+    }
+
+    #[test]
+    fn cap_never_goes_below_the_stencil_minimum() {
+        let cap = Simulation::max_cubic_size(1024, Some(1024));
+        assert_eq!(cap.side, MIN_GRID);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use clap::Parser;
 use crate::gpu::preprocess::Precision;
 use crate::gpu::render::FieldMode;
 use crate::gpu::sim::SimulationSpec;
-use crate::physics::{Model, NucleationMode};
+use crate::physics::{Model, NucleationMode, SeedSize};
 
 /// Live GPU lattice simulation of bubble nucleation and growth in a
 /// first-order cosmological phase transition.
@@ -45,6 +45,22 @@ pub struct Config {
     /// before that, so 0.2 is the recommended value.
     #[arg(long, default_value_t = 0.2)]
     pub cfl: f32,
+
+    /// Radius at which bubbles are stamped in, as a multiple of the critical
+    /// radius R_c. A real thermal fluctuation nucleates at exactly R_c, so
+    /// values just above 1 are the physically faithful choice; below 1 the
+    /// bubble collapses, which is also correct and worth watching.
+    ///
+    /// Exactly 1.0 is unstable equilibrium: discretisation error decides
+    /// whether it grows or collapses.
+    #[arg(long, default_value_t = SeedSize::DEFAULT_FACTOR)]
+    pub seed_factor: f32,
+
+    /// Seed bubbles at a fixed radius in lattice cells instead, ignoring
+    /// `--seed-factor`. Useful for holding the seed fixed while sweeping the
+    /// potential.
+    #[arg(long, value_name = "CELLS")]
+    pub seed_radius: Option<f32>,
 
     /// Number of bubbles to seed over the course of the run.
     #[arg(long, default_value_t = 12)]
@@ -112,6 +128,10 @@ impl Config {
             phi_b: 1.0,
             dx: 1.0,
             cfl: self.cfl,
+            seed_size: match self.seed_radius {
+                Some(cells) => SeedSize::Cells(cells),
+                None => SeedSize::Critical(self.seed_factor),
+            },
         }
     }
 

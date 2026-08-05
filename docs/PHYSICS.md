@@ -77,6 +77,7 @@ Useful quantities that follow, all shown live in the panel:
 | wall thickness | `l_w = 2 sqrt(2) / (phi_b sqrt(lambda))` | 4.0 cells |
 | surface tension | `sigma = int sqrt(2V) dphi = sqrt(lambda/2) phi_b^3 / 6` | 0.083 |
 | critical radius | `R_c = 2 sigma / eps` | 13.3 cells |
+| thin-wall quality | `R_c / l_w = 1 / eps_ratio` | 3.3 |
 
 `l_w` and `R_c` are the two numbers that decide whether a given parameter choice
 is resolvable on the lattice: you want `l_w` above ~3 cells, `R_c` comfortably
@@ -185,17 +186,102 @@ Bubbles are seeded explicitly, as in the published simulations of this system,
 with the planar-kink profile wrapped onto a sphere:
 
 ```
-phi(r) = (phi_b / 2) [ 1 - tanh( (r - r_0) / l_w ) ]
+phi(r) = (phi_b / 2) [ 1 - tanh( (r - R_0) / l_w ) ]
 ```
 
-at `r_0 = 1.6 R_c`, comfortably super-critical so the bubble grows rather than
-collapsing. Two schedules are offered:
+### How big should a seeded bubble be?
 
-- **simultaneous** — every bubble at `t = 0`. All bubbles are the same size at
+This is a physically loaded choice, not a free parameter, so it is exposed
+directly (`--seed-factor`, or the slider in the Nucleation panel) rather than
+buried in a default.
+
+A bubble of radius `R` has surface energy `4 pi R^2 sigma` and releases volume
+energy `(4/3) pi R^3 eps`. The two balance at
+
+```
+R_c = 2 sigma / eps
+```
+
+Below `R_c` surface tension wins and the bubble collapses; above it the volume
+term wins and it grows. **A real thermal fluctuation nucleates at exactly
+`R_c`** -- that is what "critical bubble" means -- so the physically faithful
+seed is `R_0` just barely above `R_c`, and the default is `R_0 = 1.15 R_c`.
+
+Not exactly `1.0`, because the critical bubble is in *unstable* equilibrium: at
+`R_0 = R_c` the direction it moves is decided by discretisation error rather
+than physics. The measured threshold on a 128³ lattice, one bubble, varying
+only the seed factor:
+
+| `eps_ratio` | `R_c / l_w` | `R_c` (cells) | `0.90 R_c` | `0.96 R_c` | `1.00 R_c` | `1.15 R_c` |
+|---|---|---|---|---|---|---|
+| 0.15 | 6.7 | 26.7 | 0.3% | 2.4% | 4.1% | 11.9% |
+| 0.30 | 3.3 | 13.3 | collapsed | collapsed | 5.4% | 22.2% |
+| 0.60 | 1.7 | 6.7 | 71.6% | 90.4% | 93.6% | 97.7% |
+| 0.90 | 1.1 | 4.4 | 100% | 100% | 100% | 100% |
+
+(broken-phase fraction after 700 steps; "collapsed" means the bubble vanished.)
+
+Two things to read off it. In the thin-wall regime the transition sits between
+`0.96 R_c` and `1.00 R_c`, so the thin-wall formula is accurate to a few
+percent and `1.15` carries a comfortable margin. In the thick-wall regime
+(`R_c / l_w` below about 2) even `0.90 R_c` grows, because there the thin-wall
+expression *over*-estimates the true critical radius and is only indicative.
+
+Seeding below `R_c` is allowed and does the physically correct thing: the
+bubble shrinks and disappears, radiating its surface energy away as a small
+acoustic pulse. Watching that is worth a minute -- it is the other half of what
+"critical" means:
+
+```sh
+cargo run --release -- --grid 128 --bubbles 1 --nucleation simultaneous --seed-factor 0.7
+```
+
+### How small can a bubble be?
+
+There is a floor, and it is not a numerical one. Substituting the expressions
+for `sigma`, `eps` and `l_w` into `R_c = 2 sigma / eps`, everything cancels
+except
+
+```
+R_c / l_w = 1 / eps_ratio
+```
+
+exactly, independent of `lambda` and `phi_b`. Since `eps_ratio < 1` is required
+for the barrier to exist at all, **the critical bubble is always larger than
+its own wall**. A bubble cannot be smaller than the interface that bounds it,
+which is a physical statement rather than a lattice artefact.
+
+In lattice units, with `dx = phi_b = 1`,
+
+```
+R_c = 4 / ( eps_ratio sqrt(2 lambda) )
+```
+
+so there are two ways to make bubbles start smaller relative to the box:
+
+- **Raise `eps_ratio`.** `--eps-ratio 0.6` halves `R_c` to 6.7 cells while
+  leaving the wall 4 cells thick. The cost is that `R_c / l_w` falls to 1.7, so
+  the bubble is a thick-wall one and the thin-wall formulae become indicative.
+- **Raise `lambda`.** `R_c` scales as `1/sqrt(lambda)`, but so does the wall
+  (`l_w = 2 sqrt(2) / sqrt(lambda)`), and the wall must stay above ~3 cells to
+  be resolved. This buys less than it looks like it should, because the ratio
+  is untouched.
+
+With a resolved wall and a surviving barrier the practical floor is `R_c` of a
+few cells. Below that the lattice, not the physics, is setting the answer.
+
+### Schedule
+
+Two ways to distribute bubbles in time:
+
+- **simultaneous** -- every bubble at `t = 0`. All bubbles are the same size at
   any moment, which makes the geometry of the collision network easy to read.
-- **exponential** — nucleation rate proportional to `exp(beta t)`, the
+- **exponential** -- nucleation rate proportional to `exp(beta t)`, the
   physically relevant case, which gives a broad distribution of bubble sizes
   because early bubbles have grown large by the time the last ones appear.
+
+Positions are drawn at random subject to a minimum separation of `2.5 R_0`, so
+seeded bubbles do not start out already overlapping.
 
 Stamping a bubble in by hand adds its surface and vacuum energy to the box, so
 the energy-conservation readout steps at each nucleation event. The baseline

@@ -30,6 +30,7 @@ use crate::camera::OrbitCamera;
 use crate::config::Config;
 use crate::gpu::render::{RenderSettings, VolumeRenderer};
 use crate::gpu::sim::{Diagnostics, Simulation};
+use crate::gpu::vram::{self, VramInfo};
 use crate::physics::{Model, make_schedule};
 use crate::ui::{self, SimInfo, UiCommands, UiState};
 
@@ -58,6 +59,12 @@ struct State {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
+    /// Retained so the device memory budget can be re-queried; the numbers move
+    /// as other applications come and go.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    vram: Option<VramInfo>,
+    vram_checked: Instant,
 
     sim: Simulation,
     renderer: VolumeRenderer,
@@ -212,14 +219,30 @@ impl State {
         let egui_renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
 
-        let ui = UiState {
+        let vram = vram::query(&instance, &adapter);
+        match vram {
+            Some(v) if v.available_is_measured() => log::info!(
+                "device memory: {:.1} GB total, {:.2} GB free for this process",
+                v.capacity as f64 / 1e9,
+                v.available() as f64 / 1e9,
+            ),
+            Some(v) => log::info!(
+                "device memory: {:.1} GB total (no budget reported by this driver)",
+                v.capacity as f64 / 1e9,
+            ),
+            None => log::info!("device memory: not reported by this backend"),
+        }
+
+        let mut ui = UiState {
             nucleation_mode: config.nucleation,
             bubble_count: config.bubbles,
             nucleation_duration: config.nucleation_duration,
             seed: config.seed,
             steps_per_frame: config.steps_per_frame,
+            vsync: !config.no_vsync,
             ..UiState::default()
         };
+        ui.select_lattice(grid);
 
         log::info!(
             "lattice {}x{}x{} = {:.2} M cells | dt = {:.3} | wall {:.1} cells | R_c {:.1} cells",
@@ -238,6 +261,10 @@ impl State {
             device,
             queue,
             surface_config,
+            instance,
+            adapter,
+            vram,
+            vram_checked: Instant::now(),
             sim,
             renderer,
             camera,
@@ -364,7 +391,7 @@ impl State {
         let schedule = make_schedule(
             self.ui.nucleation_mode,
             self.ui.bubble_count,
-            self.model.default_seed_radius(),
+            self.model.seed_radius(),
             self.sim.grid,
             self.ui.nucleation_duration,
             self.ui.seed,
@@ -372,6 +399,30 @@ impl State {
         self.sim.set_model(&self.queue, self.model);
         self.sim.reset(&self.device, &self.queue, Some(schedule));
         self.ui.energy_baseline = None;
+    }
+
+    /// Rebuild the simulation at a new lattice size.
+    ///
+    /// On failure the running simulation is gone -- `Simulation::resize`
+    /// validates before releasing anything, so the only way to get here is a
+    /// genuine allocation failure, which is not recoverable. Report and exit
+    /// rather than limping on with a half-built state.
+    fn resize_lattice(&mut self, grid: [u32; 3]) {
+        log::info!(
+            "resizing lattice {}x{}x{} -> {}x{}x{} ({:.2} GB)",
+            self.sim.grid[0], self.sim.grid[1], self.sim.grid[2],
+            grid[0], grid[1], grid[2],
+            Simulation::lattice_bytes(grid) as f64 / 1e9,
+        );
+        if let Err(err) = self.sim.resize(&self.device, &self.queue, grid) {
+            log::error!("lattice resize failed: {err:?}");
+            return;
+        }
+        self.renderer.rebind(&self.device, &self.sim.vis_view, grid);
+        self.ui.select_lattice(grid);
+        // Rebuild the schedule for the new box and restart from a clean state.
+        self.reset(false);
+        self.vram = vram::query(&self.instance, &self.adapter);
     }
 
     fn redraw(&mut self) {
@@ -385,10 +436,18 @@ impl State {
         self.frame_times.push_back(dt_wall);
         let mean = self.frame_times.iter().sum::<f32>() / self.frame_times.len().max(1) as f32;
         self.ui.fps = if mean > 0.0 { 1.0 / mean } else { 0.0 };
-        self.ui.gpu_frame_ms = mean * 1000.0;
+        self.ui.frame_ms = mean * 1000.0;
+        self.ui.frame_ms_max = self.frame_times.iter().copied().fold(0.0, f32::max) * 1000.0;
 
         if self.input.fly_forward != 0.0 {
             self.camera.dolly(self.input.fly_forward * dt_wall * 1.2);
+        }
+
+        // Free memory moves as other applications allocate and release; a few
+        // refreshes a second is plenty and keeps the driver call off the hot path.
+        if now.duration_since(self.vram_checked) > std::time::Duration::from_millis(250) {
+            self.vram = vram::query(&self.instance, &self.adapter);
+            self.vram_checked = now;
         }
 
         // ---- UI -------------------------------------------------------------
@@ -401,6 +460,8 @@ impl State {
             cells: self.sim.cell_count(),
             bubbles_remaining: self.sim.remaining_bubbles(),
             device_bytes: self.sim.device_memory_bytes(),
+            vram: self.vram,
+            max_storage_binding: self.device.limits().max_storage_buffer_binding_size,
         };
 
         let ctx = self.egui_ctx.clone();
@@ -409,20 +470,18 @@ impl State {
         let ui_state = &mut self.ui;
         let render_settings = &mut self.render_settings;
         let diagnostics = &self.diagnostics;
+        // The panel adds to the same command set the keyboard handler filled in,
+        // so nothing has to be copied back out.
         let full_output = ctx.run_ui(raw_input, |root| {
-            let from_ui = ui::draw(
+            ui::draw(
                 root,
                 ui_state,
                 &mut model_edit,
                 render_settings,
                 &info,
                 diagnostics,
+                &mut cmd,
             );
-            cmd.reset |= from_ui.reset;
-            cmd.reseed_and_reset |= from_ui.reseed_and_reset;
-            cmd.nucleate_now |= from_ui.nucleate_now;
-            cmd.single_step |= from_ui.single_step;
-            cmd.frame_view |= from_ui.frame_view;
         });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -439,6 +498,9 @@ impl State {
         }
         if cmd.nucleate_now {
             self.sim.nucleate_now(&mut self.rng);
+        }
+        if let Some(grid) = cmd.resize {
+            self.resize_lattice(grid);
         }
         if cmd.frame_view {
             self.camera.frame_box(self.renderer.box_half());

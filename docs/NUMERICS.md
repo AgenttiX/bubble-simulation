@@ -14,8 +14,24 @@ State is split across two buffers so both stay naturally aligned:
 | `fluid` | `(E, Zx, Zy, Zz)` | 16 |
 | `prim` | `(vx, vy, vz, p)`, recomputed each stage | 16 |
 
-Three copies of `(field, fluid)` are held, the minimum SSP-RK3 needs. Total is
-about 88 bytes per cell: 0.62 GB at 192³, 1.48 GB at 256³.
+Three copies of `(field, fluid)` are held, the minimum SSP-RK3 needs. With the
+`rgba16float` visualisation texture that is **96 bytes per cell**: 0.68 GB at
+192³, 1.61 GB at 256³, 4.98 GB at 384³, 12.8 GB at 511³.
+
+Two independent ceilings bound the lattice size, and which one binds depends on
+the device:
+
+- **`max_storage_buffer_binding_size`** caps the `fluid` buffer at 16 bytes per
+  cell. On an RTX 3090 that limit is 2.147 GB, giving 511³ — and no amount of
+  free memory relaxes it.
+- **Free device memory** caps the total at 96 bytes per cell. On a 24 GB card
+  with a desktop running, that is around 19 GB of budget, or roughly 585³.
+
+So on this hardware the API limit binds first. The Lattice panel reports both
+and says which one is doing the capping. Free memory is read through
+`VK_EXT_memory_budget`, which reports what the driver will give *this process*
+rather than raw free VRAM; measured against `nvidia-smi` it reads about 0.5 GB
+more conservative, which is the right direction to err.
 
 ## Field sector
 

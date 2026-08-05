@@ -240,6 +240,7 @@ name = "bubble-simulation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "clap",
  "egui",

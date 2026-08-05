@@ -23,7 +23,7 @@ cargo run --release
 Then drag to orbit, scroll to zoom, and press `W` to fly into the box.
 
 ```sh
-# a bigger lattice
+# a bigger lattice (also changeable live in the Lattice panel)
 cargo run --release -- --grid 256
 
 # one bubble, so you can watch a single wall and its shock in isolation
@@ -31,6 +31,15 @@ cargo run --release -- --grid 128 --bubbles 1 --nucleation simultaneous
 
 # a fast, weakly damped wall (detonation-like)
 cargo run --release -- --eta 0.02
+
+# seed right at the critical radius -- the physically faithful limit
+cargo run --release -- --seed-factor 1.02
+
+# sub-critical: watch the bubble collapse instead of growing
+cargo run --release -- --grid 128 --bubbles 1 --nucleation simultaneous --seed-factor 0.7
+
+# smaller bubbles relative to the box (halves R_c to ~7 cells)
+cargo run --release -- --eps-ratio 0.6
 
 # start on a particular view (all four stay switchable in the panel)
 cargo run --release -- --field temperature
@@ -56,6 +65,14 @@ cargo run --release -- --headless 700 --field kinetic --screenshot frame.png
 | `.` | single step |
 | `N` | nucleate a bubble now |
 | `R` | reset · `F` reset view · `H` hide panel · `Esc` quit |
+
+The **Lattice** panel resizes the box while the program is running. It reports
+how much device memory the selected size needs against how much is actually
+free, and clamps the slider to what fits — overshooting VRAM is a lost device,
+not a recoverable error, so the limit is enforced rather than merely warned
+about. Free memory is read from `VK_EXT_memory_budget`, so it reflects whatever
+else is on the GPU right now. The old lattice is released before the new one is
+allocated, so shrinking never fails for want of memory.
 
 ## What you are looking at
 
@@ -83,7 +100,11 @@ Things worth doing:
 3. Let the default 12-bubble run complete, then switch the volume field to
    *kinetic energy*. What is left is the acoustic field — this is the part that
    makes gravitational waves.
-4. Watch **energy drift**. Total energy is conserved by the continuum equations,
+4. Pull the **seed size** slider below `1.0 R_c` and hit *Nucleate one now*.
+   The bubble shrinks and vanishes, radiating its surface energy away as a
+   small acoustic pulse — the other half of what "critical" means. Just above
+   `1.0` it grows instead.
+5. Watch **energy drift**. Total energy is conserved by the continuum equations,
    so that number is a direct readout of discretisation error. Push the Courant
    number up and watch it degrade.
 
@@ -99,8 +120,15 @@ construction. Bubbles are seeded explicitly above the critical radius, as in
 published simulations of this system — thermal nucleation is far too rare to
 resolve on a lattice.
 
-Full details, including an explicit list of what the model leaves out, are in
-[docs/PHYSICS.md](docs/PHYSICS.md).
+Bubbles are born at `R_0 = 1.15 R_c` by default, just above the critical radius
+where surface tension and volume energy balance — which is where a real thermal
+fluctuation nucleates. `--seed-factor` moves it, including below 1, where
+bubbles correctly collapse. How small a bubble can physically be is bounded by
+an exact identity for this potential, `R_c / l_w = 1 / eps_ratio`: **a bubble is
+never smaller than the wall that bounds it.**
+
+Full details, including the measured grow/collapse threshold and an explicit
+list of what the model leaves out, are in [docs/PHYSICS.md](docs/PHYSICS.md).
 
 ## Numerics
 
@@ -157,6 +185,7 @@ src/
   gpu/sim.rs       buffers, pipelines, the time step
   gpu/render.rs    volume renderer
   gpu/preprocess.rs  WGSL include resolution + precision alias injection
+  gpu/vram.rs      device memory budget, via VK_EXT_memory_budget
   headless.rs      windowless runs for benchmarking and validation
   app.rs           window, device, frame loop
 ```
@@ -167,10 +196,12 @@ A GPU with Vulkan, Metal, or DX12. Developed against an **NVIDIA RTX 3090**;
 the defaults are sized for it. Memory is roughly 88 bytes per cell, so 192³
 needs 0.62 GB and 256³ needs 1.48 GB.
 
-`cargo test` runs 18 tests covering the parameter derivation, shader assembly,
+`cargo test` runs 29 tests covering the parameter derivation, shader assembly,
 buffer rotation, and struct layouts — no GPU required. `--headless` exercises
 the solver against a GPU without a display, and `--screenshot` does the same
-for the renderer.
+for the renderer. `cargo test -- --ignored` adds 5 tests that need a real
+device, covering the lattice resize path (grow, shrink, non-cubic, rejected
+sizes, and that the old lattice is genuinely released).
 
 ## License
 

@@ -20,6 +20,27 @@ use rand_pcg::Pcg64Mcg;
 /// question rather than a source-level one; see `docs/PRECISION.md`.
 pub type Scalar = f32;
 
+/// How large a bubble is when it is stamped into the lattice.
+///
+/// The physically meaningful scale is the critical radius `R_c`: a bubble
+/// below it collapses under its own surface tension, a bubble above it grows.
+/// A genuine thermal fluctuation nucleates *at* `R_c`, so the closer to 1 the
+/// factor is, the more faithful the seeding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SeedSize {
+    /// A multiple of the critical radius.  Tracks `R_c`, so the seeding stays
+    /// physically meaningful when the potential is retuned live.
+    Critical(Scalar),
+    /// A fixed number of lattice cells, regardless of `R_c`.
+    Cells(Scalar),
+}
+
+impl SeedSize {
+    /// Just above critical: the smallest seed that reliably grows rather than
+    /// collapsing.  See `Model::seed_radius` for why it is not exactly 1.
+    pub const DEFAULT_FACTOR: Scalar = 1.15;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Model {
     /// Quartic coupling of the scalar potential.  Sets the wall thickness
@@ -42,6 +63,8 @@ pub struct Model {
     pub dx: Scalar,
     /// Courant number: `dt = cfl * dx`.
     pub cfl: Scalar,
+    /// Radius at which bubbles are stamped in.
+    pub seed_size: SeedSize,
 }
 
 impl Default for Model {
@@ -54,6 +77,7 @@ impl Default for Model {
             phi_b: 1.0,
             dx: 1.0,
             cfl: 0.2,
+            seed_size: SeedSize::Critical(SeedSize::DEFAULT_FACTOR),
         }
     }
 }
@@ -115,10 +139,39 @@ impl Model {
         self.cfl * self.dx
     }
 
-    /// A sensible seed radius: comfortably super-critical and comfortably
-    /// thicker than the wall so the initial profile is well resolved.
-    pub fn default_seed_radius(&self) -> Scalar {
-        (1.6 * self.critical_radius()).max(3.0 * self.wall_width())
+    /// Radius at which bubbles are stamped in, in the same units as `dx`.
+    ///
+    /// The default is `1.15 R_c` rather than exactly `R_c` for a specific
+    /// reason: the critical bubble is in *unstable* equilibrium, so at exactly
+    /// `R_c` the direction it moves is decided by discretisation error rather
+    /// than physics, and it collapses about as often as it grows.  A few
+    /// percent above critical is the smallest seed that reliably grows, and is
+    /// far closer to a real thermal fluctuation than the comfortable margin a
+    /// simulation is usually given.
+    ///
+    /// Seeding *below* `R_c` is allowed and does the physically correct thing:
+    /// the bubble collapses.
+    pub fn seed_radius(&self) -> Scalar {
+        match self.seed_size {
+            SeedSize::Critical(k) => k * self.critical_radius(),
+            SeedSize::Cells(r) => r,
+        }
+        .max(0.25 * self.dx)
+    }
+
+    /// Ratio of critical radius to wall thickness.
+    ///
+    /// For this potential the thin-wall expressions collapse to the exact
+    /// relation `R_c / l_w = 1 / eps_ratio`, independent of `lambda` and
+    /// `phi_b`.  Two consequences worth knowing:
+    ///
+    ///   * the critical bubble is never *smaller* than its own wall, so there
+    ///     is a hard floor on how small a physically meaningful seed can be;
+    ///   * `eps_ratio` alone controls how well the thin-wall picture applies.
+    ///     Below about 3 the bubble is a "thick-wall" one and `R_c = 2 sigma /
+    ///     eps` is only indicative.
+    pub fn critical_to_wall_ratio(&self) -> Scalar {
+        1.0 / self.eps_ratio
     }
 
     /// Rough terminal wall velocity from the force balance
@@ -150,6 +203,15 @@ impl Model {
         }
         if self.cfl <= 0.0 || self.cfl > 0.5 {
             return Err("cfl must lie in (0, 0.5]; see docs/NUMERICS.md".into());
+        }
+        match self.seed_size {
+            SeedSize::Critical(k) if k <= 0.0 => {
+                return Err("seed factor must be positive".into());
+            }
+            SeedSize::Cells(r) if r <= 0.0 => {
+                return Err("seed radius must be positive".into());
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -279,6 +341,47 @@ mod tests {
         // V = (lambda/4) phi^2 (phi - phi_b)^2 has m2 = lambda/2, delta = 3 lambda/2.
         assert!((m.m2() - 0.5 * m.lambda).abs() < 1e-4);
         assert!((m.delta() - 1.5 * m.lambda).abs() < 1e-4);
+    }
+
+    /// The thin-wall expressions collapse to R_c / l_w = 1 / eps_ratio exactly.
+    /// This is what puts a floor under how small a meaningful seed can be.
+    #[test]
+    fn critical_radius_is_never_smaller_than_the_wall() {
+        for eps_ratio in [0.05, 0.2, 0.3, 0.6, 0.95] {
+            for lambda in [0.1, 0.5, 1.5] {
+                let m = Model { eps_ratio, lambda, ..Model::default() };
+                let ratio = m.critical_radius() / m.wall_width();
+                assert!(
+                    (ratio - m.critical_to_wall_ratio()).abs() < 1e-3 * ratio,
+                    "R_c/l_w should be 1/eps_ratio: got {ratio} vs {}",
+                    m.critical_to_wall_ratio()
+                );
+                assert!(ratio > 1.0, "the critical bubble must exceed its own wall");
+            }
+        }
+    }
+
+    #[test]
+    fn seed_radius_follows_the_chosen_mode() {
+        let m = Model { seed_size: SeedSize::Critical(1.15), ..Model::default() };
+        assert!((m.seed_radius() - 1.15 * m.critical_radius()).abs() < 1e-4);
+
+        // A factor mode tracks R_c when the potential is retuned.
+        let softer = Model { eps_ratio: 0.6, ..m };
+        assert!(softer.seed_radius() < m.seed_radius());
+
+        // A cells mode does not.
+        let fixed = Model { seed_size: SeedSize::Cells(7.5), ..Model::default() };
+        assert!((fixed.seed_radius() - 7.5).abs() < 1e-6);
+        let fixed_softer = Model { eps_ratio: 0.6, ..fixed };
+        assert!((fixed_softer.seed_radius() - 7.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sub_critical_seeds_are_allowed_so_collapse_can_be_shown() {
+        let m = Model { seed_size: SeedSize::Critical(0.5), ..Model::default() };
+        m.validate().expect("sub-critical seeding is physical, not an error");
+        assert!(m.seed_radius() < m.critical_radius());
     }
 
     #[test]
